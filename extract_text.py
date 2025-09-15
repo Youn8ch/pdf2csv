@@ -38,6 +38,7 @@ def extract_text(pdf_path: str | Path) -> List[str]:
 if __name__ == "__main__":
     import sys
 
+
     if len(sys.argv) < 2:
         raise SystemExit("Usage: python extract_text.py <PDF_PATH>")
 
