@@ -3,7 +3,7 @@ from pathlib import Path
 
 try:
     import PyPDF2
-except Exception as e:
+except ImportError:
     PyPDF2 = None
 
 
@@ -37,10 +37,19 @@ def extract_text(pdf_path: str | Path) -> List[str]:
 
 if __name__ == "__main__":
     import sys
+
+
     if len(sys.argv) < 2:
         raise SystemExit("Usage: python extract_text.py <PDF_PATH>")
-    pdf = sys.argv[1]
+
+    pdf = Path(sys.argv[1])
     pages = extract_text(pdf)
-    for i, content in enumerate(pages, 1):
-        print(f"--- Page {i} ---")
-        print(content)
+
+    output_path = pdf.with_suffix(".md")
+    with output_path.open("w", encoding="utf-8") as fh:
+        for i, content in enumerate(pages, 1):
+            fh.write(f"## Page {i}\n\n")
+            fh.write(content)
+            fh.write("\n\n")
+
+    print(f"Wrote {len(pages)} pages of text to {output_path}")
