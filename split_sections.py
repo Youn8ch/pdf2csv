@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import re
 from pathlib import Path
+
 from typing import Iterator, List, Sequence
 
 __all__ = ["split_sections", "export_sections"]
@@ -46,6 +47,7 @@ def _looks_like_toc_filler(line: str) -> bool:
 
 # Separator inserted between exported sections.
 _DEFAULT_DELIMITER = "====="
+
 
 
 def _ensure_markdown_suffix(path: Path) -> Path:
@@ -119,6 +121,7 @@ def export_sections(
 
     path = _ensure_markdown_suffix(Path(output_path))
     path.parent.mkdir(parents=True, exist_ok=True)
+
     normalized_sections = [section.strip("\n") for section in sections if section.strip()]
     content = f"\n{delimiter}\n".join(normalized_sections)
     if content and not content.endswith("\n"):
@@ -131,6 +134,7 @@ def split_sections(
     *,
     delimiter: str = _DEFAULT_DELIMITER,
 ) -> list[str]:
+
     """Split the markdown manual into the smallest numbered chapters.
 
     Parameters
@@ -141,11 +145,14 @@ def split_sections(
         encodings accidentally.
     """
 
+
     path = Path(markdown_path)
     if not path.exists():
         raise FileNotFoundError(path)
+
     if path.suffix.lower() != ".md":
         raise ValueError(f"split_sections expects a .md file, got {path}")
+
 
     sections: list[str] = []
     current: list[str] = []
@@ -227,7 +234,9 @@ def main(argv: Sequence[str] | None = None) -> None:  # pragma: no cover - CLI h
         "-o",
         "--output",
         type=Path,
+
         help="Output markdown file (default: <input stem>_sections.md)",
+
     )
     parser.add_argument(
         "-n",
@@ -241,15 +250,18 @@ def main(argv: Sequence[str] | None = None) -> None:  # pragma: no cover - CLI h
         default=_DEFAULT_DELIMITER,
         help="String used to separate sections when exporting (default: '=====')",
     )
+
     parser.add_argument(
         "--no-export",
         action="store_true",
         help="Skip writing the split sections to disk",
     )
+
     args = parser.parse_args(argv)
 
     sections = split_sections(args.markdown, delimiter=args.delimiter)
     print(f"Detected {len(sections)} sections in {args.markdown}")
+
 
     if not args.no_export:
         default_output = args.markdown.with_name(args.markdown.stem + "_sections.md")
@@ -257,6 +269,7 @@ def main(argv: Sequence[str] | None = None) -> None:  # pragma: no cover - CLI h
         export_sections(sections, target, delimiter=args.delimiter)
         normalized_target = _ensure_markdown_suffix(Path(target))
         print(f"Wrote sections to {normalized_target}")
+
 
     if args.preview:
         for index, section in enumerate(sections[: args.preview], start=1):
