@@ -4,13 +4,16 @@ This module focuses on the ``split_sections`` helper requested in the design
 notes.  The PDF is converted to markdown first (see :mod:`extract_text`), after
 which the markdown is divided into the smallest numbered chapters.  Each
 chapter is returned as a string and can optionally be exported into another
-``.md`` file with ``=====`` separators for manual inspection.
+``.md`` file with ``=====`` separators for manual inspection.  Both the input
+and exported files are normalized to use the ``.md`` extension so they can be
+fed back into the debugging workflow directly.
 """
 from __future__ import annotations
 
-from pathlib import Path
 import argparse
 import re
+from pathlib import Path
+
 from typing import Iterator, List, Sequence
 
 __all__ = ["split_sections", "export_sections"]
@@ -44,6 +47,15 @@ def _looks_like_toc_filler(line: str) -> bool:
 
 # Separator inserted between exported sections.
 _DEFAULT_DELIMITER = "====="
+
+
+
+def _ensure_markdown_suffix(path: Path) -> Path:
+    """Return ``path`` with a ``.md`` suffix, replacing any existing suffix."""
+
+    if path.suffix.lower() == ".md":
+        return path
+    return path.with_suffix(".md")
 
 
 def _iter_markdown_lines(path: Path) -> Iterator[str]:
@@ -101,9 +113,15 @@ def export_sections(
     *,
     delimiter: str = _DEFAULT_DELIMITER,
 ) -> None:
-    """Write ``sections`` to ``output_path`` separated by ``delimiter`` lines."""
+    """Write ``sections`` to ``output_path`` separated by ``delimiter`` lines.
 
-    path = Path(output_path)
+    The destination is forced to use a ``.md`` suffix to keep the intermediate
+    artifacts compatible with markdown-aware tooling.
+    """
+
+    path = _ensure_markdown_suffix(Path(output_path))
+    path.parent.mkdir(parents=True, exist_ok=True)
+
     normalized_sections = [section.strip("\n") for section in sections if section.strip()]
     content = f"\n{delimiter}\n".join(normalized_sections)
     if content and not content.endswith("\n"):
@@ -116,11 +134,25 @@ def split_sections(
     *,
     delimiter: str = _DEFAULT_DELIMITER,
 ) -> list[str]:
-    """Split the markdown manual into the smallest numbered chapters."""
+
+    """Split the markdown manual into the smallest numbered chapters.
+
+    Parameters
+    ----------
+    markdown_path:
+        Path to a vendor manual exported as ``.md``.  A ``ValueError`` is
+        raised when the suffix is not ``.md`` to avoid mixing in other text
+        encodings accidentally.
+    """
+
 
     path = Path(markdown_path)
     if not path.exists():
         raise FileNotFoundError(path)
+
+    if path.suffix.lower() != ".md":
+        raise ValueError(f"split_sections expects a .md file, got {path}")
+
 
     sections: list[str] = []
     current: list[str] = []
@@ -202,7 +234,9 @@ def main(argv: Sequence[str] | None = None) -> None:  # pragma: no cover - CLI h
         "-o",
         "--output",
         type=Path,
-        help="Optional output path. Sections are separated by '=====' lines for debugging.",
+
+        help="Output markdown file (default: <input stem>_sections.md)",
+
     )
     parser.add_argument(
         "-n",
@@ -216,14 +250,26 @@ def main(argv: Sequence[str] | None = None) -> None:  # pragma: no cover - CLI h
         default=_DEFAULT_DELIMITER,
         help="String used to separate sections when exporting (default: '=====')",
     )
+
+    parser.add_argument(
+        "--no-export",
+        action="store_true",
+        help="Skip writing the split sections to disk",
+    )
+
     args = parser.parse_args(argv)
 
     sections = split_sections(args.markdown, delimiter=args.delimiter)
     print(f"Detected {len(sections)} sections in {args.markdown}")
 
-    if args.output:
-        export_sections(sections, args.output, delimiter=args.delimiter)
-        print(f"Wrote sections to {args.output}")
+
+    if not args.no_export:
+        default_output = args.markdown.with_name(args.markdown.stem + "_sections.md")
+        target = args.output or default_output
+        export_sections(sections, target, delimiter=args.delimiter)
+        normalized_target = _ensure_markdown_suffix(Path(target))
+        print(f"Wrote sections to {normalized_target}")
+
 
     if args.preview:
         for index, section in enumerate(sections[: args.preview], start=1):
