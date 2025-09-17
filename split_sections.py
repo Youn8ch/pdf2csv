@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import argparse
 import re
+import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-__all__ = ["split_sections", "export_sections"]
+__all__ = ["split_sections", "export_sections", "TOCReport", "HeadingInfo", "TOCMatch"]
 
 _DEFAULT_DELIMITER = "====="
 _TOC_PAGE_LIMIT = 20
@@ -15,6 +17,63 @@ _DOTTED_LEADER_RE = re.compile(r"[.·]{2,}")
 _TOC_ENTRY_START_RE = re.compile(r"^\s*\d+(?:\.\d+)*\s+")
 _ENTRY_SPLIT_RE = re.compile(r"^\s*(\d+(?:\.\d+)*)\s+(.*)$")
 _NUMBERED_HEADING_RE = re.compile(r"^\d+(?:\.\d+)*\s+\S")
+
+
+@dataclass
+class HeadingInfo:
+    """Location metadata for a heading extracted from the document body."""
+
+    text: str
+    page_index: int
+    line_index: int
+
+    def location_label(self) -> str:
+        """Return a human-friendly ``page/line`` label for debugging."""
+
+        return f"page {self.page_index + 1}, line {self.line_index + 1}"
+
+
+@dataclass
+class TOCMatch:
+    """Pair a table-of-contents heading with its document counterpart."""
+
+    toc_heading: str
+    document_heading: HeadingInfo
+
+
+@dataclass
+class TOCReport:
+    """Verification summary for the extracted table of contents."""
+
+    raw_headings: list[str]
+    matches: list[TOCMatch]
+    missing: list[str]
+    duplicates: list[str]
+    orphans: list[HeadingInfo]
+
+    @property
+    def validated(self) -> list[str]:
+        """Return the canonical headings confirmed to exist in the body."""
+
+        return [match.document_heading.text for match in self.matches]
+
+    @property
+    def total(self) -> int:
+        """Return the number of raw headings detected in the table of contents."""
+
+        return len(self.raw_headings)
+
+    @property
+    def validated_count(self) -> int:
+        """Return how many headings were confirmed against the document body."""
+
+        return len(self.matches)
+
+    @property
+    def has_issues(self) -> bool:
+        """Return ``True`` when verification uncovered inconsistencies."""
+
+        return bool(self.missing or self.duplicates or self.orphans)
 
 def _ensure_markdown_suffix(path: Path) -> Path:
     """Return ``path`` with a ``.md`` suffix, replacing any existing suffix."""
@@ -55,6 +114,16 @@ def _normalize_spaces(text: str) -> str:
     return re.sub(r"\s+", " ", text.replace("\u3000", " ")).strip()
 
 
+def _normalize_heading_key(text: str) -> str:
+    """Return a normalised key for matching headings across sources."""
+
+    normalized = text.replace("\u3000", " ")
+    normalized = re.sub(r"\s*/\s*", "/", normalized)
+    normalized = normalized.replace("：", ":")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return re.sub(r"\s+", "", normalized).lower()
+
+
 def _is_toc_marker(text: str) -> bool:
     """Return ``True`` if ``text`` marks the beginning of the table of contents."""
 
@@ -82,18 +151,21 @@ def _clean_toc_entry(raw: str) -> str | None:
     return heading
 
 
-def _extract_toc_entries(pages: Sequence[Sequence[str]], *, max_pages: int = _TOC_PAGE_LIMIT) -> list[str]:
-    """Return headings discovered in the table of contents."""
+def _extract_toc_entries(
+    pages: Sequence[Sequence[str]], *, max_pages: int = _TOC_PAGE_LIMIT
+) -> tuple[list[str], tuple[int, int] | None]:
+    """Return headings discovered in the table of contents and the last TOC position."""
 
     entries: list[str] = []
     seen: set[str] = set()
     buffer: list[str] = []
     toc_started = False
+    last_position: tuple[int, int] | None = None
 
     for page_index, page in enumerate(pages):
         if page_index >= max_pages:
             break
-        for line in page:
+        for line_index, line in enumerate(page):
             stripped = line.strip()
             if not stripped:
                 continue
@@ -109,15 +181,16 @@ def _extract_toc_entries(pages: Sequence[Sequence[str]], *, max_pages: int = _TO
                     if entry and entry not in seen:
                         entries.append(entry)
                         seen.add(entry)
-                    buffer = []
                 buffer = [stripped]
+                last_position = (page_index, line_index)
             elif buffer:
                 buffer.append(stripped)
+                last_position = (page_index, line_index)
     if buffer:
         entry = _clean_toc_entry(" ".join(buffer))
         if entry and entry not in seen:
             entries.append(entry)
-    return entries
+    return entries, last_position
 
 
 def _normalize_content_heading(line: str) -> str | None:
@@ -128,6 +201,8 @@ def _normalize_content_heading(line: str) -> str | None:
     if not match:
         return None
     label, title = match.groups()
+    title = re.sub(r"[.·]{2,}.*$", "", title)
+    title = re.sub(r"\s+\d+\s*$", "", title)
     title = _normalize_spaces(title)
     title = re.sub(r"[:：]\s*$", "", title).rstrip()
     if not title:
@@ -136,6 +211,102 @@ def _normalize_content_heading(line: str) -> str | None:
     if not _NUMBERED_HEADING_RE.match(heading):
         return None
     return heading
+
+
+def _collect_document_headings(
+    pages: Sequence[Sequence[str]],
+    *,
+    start_after: tuple[int, int] | None,
+) -> tuple[dict[str, HeadingInfo], list[str]]:
+    """Return body headings after ``start_after`` as a mapping and ordered keys."""
+
+    heading_map: dict[str, HeadingInfo] = {}
+    order: list[str] = []
+
+    for page_index, page in enumerate(pages):
+        if start_after is not None:
+            toc_page, toc_line = start_after
+            if page_index < toc_page:
+                continue
+            line_start = toc_line + 1 if page_index == toc_page else 0
+        else:
+            line_start = 0
+        for line_index in range(line_start, len(page)):
+            normalized = _normalize_content_heading(page[line_index])
+            if normalized is None:
+                continue
+            key = _normalize_heading_key(normalized)
+            if key not in heading_map:
+                heading_map[key] = HeadingInfo(normalized, page_index, line_index)
+                order.append(key)
+    return heading_map, order
+
+
+def _verify_toc_against_body(
+    toc_headings: Sequence[str],
+    heading_map: dict[str, HeadingInfo],
+    heading_order: Sequence[str],
+) -> TOCReport:
+    """Cross-check table-of-contents headings against document headings."""
+
+    matches: list[TOCMatch] = []
+    missing: list[str] = []
+    duplicates: list[str] = []
+    seen_keys: set[str] = set()
+
+    for heading in toc_headings:
+        key = _normalize_heading_key(heading)
+        if key in seen_keys:
+            duplicates.append(heading)
+            continue
+        seen_keys.add(key)
+        info = heading_map.get(key)
+        if info is None:
+            missing.append(heading)
+            continue
+        matches.append(TOCMatch(heading, info))
+
+    toc_key_set = set(_normalize_heading_key(h) for h in toc_headings)
+    orphans = [heading_map[key] for key in heading_order if key not in toc_key_set]
+
+    return TOCReport(
+        raw_headings=list(toc_headings),
+        matches=matches,
+        missing=missing,
+        duplicates=duplicates,
+        orphans=orphans,
+    )
+
+
+def _print_toc_report(report: TOCReport, *, stream=sys.stderr, limit: int = 10) -> None:
+    """Emit a short verification summary for ``report`` to ``stream``."""
+
+    print(
+        f"TOC entries detected: {report.total}; validated in body: {report.validated_count}",
+        file=stream,
+    )
+    if report.missing:
+        print("Missing in body:", file=stream)
+        for heading in report.missing[:limit]:
+            print(f"  - {heading}", file=stream)
+        if len(report.missing) > limit:
+            remaining = len(report.missing) - limit
+            print(f"  … {remaining} more", file=stream)
+    if report.duplicates:
+        print("Duplicate entries in TOC:", file=stream)
+        for heading in report.duplicates[:limit]:
+            print(f"  - {heading}", file=stream)
+        if len(report.duplicates) > limit:
+            remaining = len(report.duplicates) - limit
+            print(f"  … {remaining} more", file=stream)
+    if report.orphans:
+        print("Headings seen in body but missing from TOC:", file=stream)
+        for info in report.orphans[:limit]:
+            print(f"  - {info.text} ({info.location_label()})", file=stream)
+        if len(report.orphans) > limit:
+            remaining = len(report.orphans) - limit
+            print(f"  … {remaining} more", file=stream)
+        print("Hint: increase --toc-pages to scan additional pages if these headings belong in the TOC.", file=stream)
 
 
 def _trim_trailing_blanks(lines: Sequence[str]) -> list[str]:
@@ -198,8 +369,8 @@ def _load_pages_and_headings(
     markdown_path: str | Path,
     *,
     toc_pages: int,
-) -> tuple[list[list[str]], list[str]]:
-    """Return document pages and discovered headings for ``markdown_path``."""
+) -> tuple[list[list[str]], TOCReport]:
+    """Return document pages and a verified table-of-contents report."""
 
     path = Path(markdown_path)
     if not path.exists():
@@ -208,10 +379,14 @@ def _load_pages_and_headings(
         raise ValueError(f"split_sections expects a .md file, got {path}")
 
     pages = _read_pages(path)
-    headings = _extract_toc_entries(pages, max_pages=toc_pages)
-    if not headings:
+    toc_headings, toc_last_position = _extract_toc_entries(pages, max_pages=toc_pages)
+    if not toc_headings:
         raise ValueError("Failed to locate table-of-contents headings in the markdown file")
-    return pages, headings
+    heading_map, heading_order = _collect_document_headings(pages, start_after=toc_last_position)
+    report = _verify_toc_against_body(toc_headings, heading_map, heading_order)
+    if not report.matches:
+        raise ValueError("No table-of-contents headings could be validated against the document body")
+    return pages, report
 
 
 def export_sections(
@@ -239,8 +414,8 @@ def split_sections(
 ) -> list[str]:
     """Split the markdown manual into sections based on table-of-contents entries."""
 
-    pages, headings = _load_pages_and_headings(markdown_path, toc_pages=toc_pages)
-    return _segment_by_headings(pages, headings, delimiter=delimiter)
+    pages, report = _load_pages_and_headings(markdown_path, toc_pages=toc_pages)
+    return _segment_by_headings(pages, report.validated, delimiter=delimiter)
 
 
 def _preview(section: str, limit: int = 20) -> str:
@@ -292,12 +467,17 @@ def main(argv: Sequence[str] | None = None) -> None:  # pragma: no cover - CLI h
     )
     args = parser.parse_args(argv)
 
-    pages, headings = _load_pages_and_headings(args.markdown, toc_pages=args.toc_pages)
+    pages, report = _load_pages_and_headings(args.markdown, toc_pages=args.toc_pages)
+    headings = report.validated
 
     if args.print_toc:
-        for heading in headings:
-            print(heading)
+        for match in report.matches:
+            print(match.document_heading.text)
+        _print_toc_report(report)
         return
+
+    if report.has_issues:
+        _print_toc_report(report)
 
     sections = _segment_by_headings(pages, headings, delimiter=args.delimiter)
     print(f"Detected {len(sections)} sections in {args.markdown}")
