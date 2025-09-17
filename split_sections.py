@@ -12,9 +12,9 @@ _DEFAULT_DELIMITER = "====="
 _TOC_PAGE_LIMIT = 20
 
 _DOTTED_LEADER_RE = re.compile(r"[.·]{2,}")
-_TOC_ENTRY_START_RE = re.compile(r"^\s*\d+(?:\.\d+)+\s+")
-_ENTRY_SPLIT_RE = re.compile(r"^\s*(\d+(?:\.\d+)+)\s+(.*)$")
-_NUMBERED_HEADING_RE = re.compile(r"^\d+(?:\.\d+)+\s+\S")
+_TOC_ENTRY_START_RE = re.compile(r"^\s*\d+(?:\.\d+)*\s+")
+_ENTRY_SPLIT_RE = re.compile(r"^\s*(\d+(?:\.\d+)*)\s+(.*)$")
+_NUMBERED_HEADING_RE = re.compile(r"^\d+(?:\.\d+)*\s+\S")
 
 
 def _ensure_markdown_suffix(path: Path) -> Path:
@@ -74,6 +74,7 @@ def _clean_toc_entry(raw: str) -> str | None:
     title = re.sub(r"[.·]{2,}.*$", "", title)
     title = re.sub(r"\s+\d+\s*$", "", title)
     title = _normalize_spaces(title)
+    title = re.sub(r"[:：]\s*$", "", title).rstrip()
     if not title:
         return None
     heading = f"{label} {title}"
@@ -129,6 +130,7 @@ def _normalize_content_heading(line: str) -> str | None:
         return None
     label, title = match.groups()
     title = _normalize_spaces(title)
+    title = re.sub(r"[:：]\s*$", "", title).rstrip()
     if not title:
         return None
     heading = f"{label} {title}"
@@ -193,6 +195,26 @@ def _segment_by_headings(
     return sections
 
 
+def _load_pages_and_headings(
+    markdown_path: str | Path,
+    *,
+    toc_pages: int,
+) -> tuple[list[list[str]], list[str]]:
+    """Return document pages and discovered headings for ``markdown_path``."""
+
+    path = Path(markdown_path)
+    if not path.exists():
+        raise FileNotFoundError(path)
+    if path.suffix.lower() != ".md":
+        raise ValueError(f"split_sections expects a .md file, got {path}")
+
+    pages = _read_pages(path)
+    headings = _extract_toc_entries(pages, max_pages=toc_pages)
+    if not headings:
+        raise ValueError("Failed to locate table-of-contents headings in the markdown file")
+    return pages, headings
+
+
 def export_sections(
     sections: Sequence[str],
     output_path: str | Path,
@@ -218,16 +240,7 @@ def split_sections(
 ) -> list[str]:
     """Split the markdown manual into sections based on table-of-contents entries."""
 
-    path = Path(markdown_path)
-    if not path.exists():
-        raise FileNotFoundError(path)
-    if path.suffix.lower() != ".md":
-        raise ValueError(f"split_sections expects a .md file, got {path}")
-
-    pages = _read_pages(path)
-    headings = _extract_toc_entries(pages, max_pages=toc_pages)
-    if not headings:
-        raise ValueError("Failed to locate table-of-contents headings in the markdown file")
+    pages, headings = _load_pages_and_headings(markdown_path, toc_pages=toc_pages)
     return _segment_by_headings(pages, headings, delimiter=delimiter)
 
 
@@ -258,6 +271,11 @@ def main(argv: Sequence[str] | None = None) -> None:  # pragma: no cover - CLI h
         help="Print the first N sections after splitting",
     )
     parser.add_argument(
+        "--print-toc",
+        action="store_true",
+        help="Only print the extracted table-of-contents headings and exit",
+    )
+    parser.add_argument(
         "--delimiter",
         default=_DEFAULT_DELIMITER,
         help="String used to separate sections when exporting (default: '=====')",
@@ -275,7 +293,14 @@ def main(argv: Sequence[str] | None = None) -> None:  # pragma: no cover - CLI h
     )
     args = parser.parse_args(argv)
 
-    sections = split_sections(args.markdown, delimiter=args.delimiter, toc_pages=args.toc_pages)
+    pages, headings = _load_pages_and_headings(args.markdown, toc_pages=args.toc_pages)
+
+    if args.print_toc:
+        for heading in headings:
+            print(heading)
+        return
+
+    sections = _segment_by_headings(pages, headings, delimiter=args.delimiter)
     print(f"Detected {len(sections)} sections in {args.markdown}")
 
     if not args.no_export:
