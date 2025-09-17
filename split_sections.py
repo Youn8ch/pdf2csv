@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+import math
 import re
 from pathlib import Path
 from typing import Sequence
@@ -15,6 +17,9 @@ _DOTTED_LEADER_RE = re.compile(r"[.·]{2,}")
 _TOC_ENTRY_START_RE = re.compile(r"^\s*\d+(?:\.\d+)*\s+")
 _ENTRY_SPLIT_RE = re.compile(r"^\s*(\d+(?:\.\d+)*)\s+(.*)$")
 _NUMBERED_HEADING_RE = re.compile(r"^\d+(?:\.\d+)*\s+\S")
+_REPEATED_WHITESPACE_RE = re.compile(r"\s+")
+_ROMAN_NUMERAL_RE = re.compile(r"\b[ivxlcdm]+\b", re.IGNORECASE)
+_DIGITS_RE = re.compile(r"\d+")
 
 
 def _ensure_markdown_suffix(path: Path) -> Path:
@@ -42,6 +47,122 @@ def _read_pages(path: Path) -> list[list[str]]:
     if current:
         pages.append(current)
     return pages
+
+
+def _normalize_repeated_line(text: str) -> str:
+    """Return a normalised representation for header/footer comparisons."""
+
+    collapsed = text.replace("\u3000", " ").strip()
+    if not collapsed:
+        return ""
+    collapsed = _REPEATED_WHITESPACE_RE.sub(" ", collapsed).lower()
+    collapsed = _DIGITS_RE.sub("<num>", collapsed)
+    collapsed = _ROMAN_NUMERAL_RE.sub("<roman>", collapsed)
+    return collapsed
+
+
+def _take_nonempty(lines: Sequence[str], limit: int, *, from_end: bool = False) -> list[str]:
+    """Return up to ``limit`` non-empty lines from the start or end of ``lines``."""
+
+    result: list[str] = []
+    iterable = reversed(lines) if from_end else iter(lines)
+    for line in iterable:
+        if line.strip():
+            result.append(line)
+            if len(result) >= limit:
+                break
+    if from_end:
+        result.reverse()
+    return result
+
+
+def _collect_repeated_header_footer_patterns(
+    pages: Sequence[Sequence[str]],
+    *,
+    top_lines: int = 5,
+    bottom_lines: int = 5,
+    min_ratio: float = 0.7,
+    min_repeats: int = 2,
+) -> tuple[set[str], set[str]]:
+    """Return normalised header/footer line patterns that repeat across pages."""
+
+    total_pages = len(pages)
+    if total_pages < min_repeats:
+        return set(), set()
+
+    top_counter: Counter[str] = Counter()
+    bottom_counter: Counter[str] = Counter()
+
+    for page in pages:
+        if not page:
+            continue
+        top_candidates = _take_nonempty(page, top_lines)
+        bottom_candidates = _take_nonempty(page, bottom_lines, from_end=True)
+        for candidate in top_candidates:
+            normalized = _normalize_repeated_line(candidate)
+            if normalized:
+                top_counter[normalized] += 1
+        for candidate in bottom_candidates:
+            normalized = _normalize_repeated_line(candidate)
+            if normalized:
+                bottom_counter[normalized] += 1
+
+    threshold = max(min_repeats, int(math.ceil(total_pages * min_ratio)))
+    top_patterns = {pattern for pattern, count in top_counter.items() if count >= threshold}
+    bottom_patterns = {pattern for pattern, count in bottom_counter.items() if count >= threshold}
+    return top_patterns, bottom_patterns
+
+
+def _trim_leading_blanks(lines: Sequence[str]) -> list[str]:
+    """Remove leading blank lines from ``lines``."""
+
+    trimmed = list(lines)
+    while trimmed and not trimmed[0].strip():
+        trimmed.pop(0)
+    return trimmed
+
+
+def _strip_repeated_patterns(
+    lines: Sequence[str],
+    patterns: set[str],
+    *,
+    from_end: bool = False,
+) -> list[str]:
+    """Remove header/footer lines whose normalised form is present in ``patterns``."""
+
+    if not patterns:
+        return list(lines)
+
+    trimmed = list(lines)
+    while trimmed:
+        index = -1 if from_end else 0
+        candidate = trimmed[index]
+        if not candidate.strip():
+            trimmed.pop(index)
+            continue
+        normalized = _normalize_repeated_line(candidate)
+        if normalized in patterns:
+            trimmed.pop(index)
+            continue
+        break
+    return trimmed
+
+
+def _remove_repeated_headers_and_footers(pages: Sequence[Sequence[str]]) -> list[list[str]]:
+    """Strip recurring header/footer blocks from each page."""
+
+    top_patterns, bottom_patterns = _collect_repeated_header_footer_patterns(pages)
+    if not top_patterns and not bottom_patterns:
+        return [list(page) for page in pages]
+
+    cleaned_pages: list[list[str]] = []
+    for page in pages:
+        lines = list(page)
+        lines = _strip_repeated_patterns(lines, top_patterns)
+        lines = _strip_repeated_patterns(lines, bottom_patterns, from_end=True)
+        lines = _trim_leading_blanks(_trim_trailing_blanks(lines))
+        cleaned_pages.append(lines)
+    return cleaned_pages
 
 
 def _normalize_marker(text: str) -> str:
@@ -208,7 +329,8 @@ def _load_pages_and_headings(
     if path.suffix.lower() != ".md":
         raise ValueError(f"split_sections expects a .md file, got {path}")
 
-    pages = _read_pages(path)
+    raw_pages = _read_pages(path)
+    pages = _remove_repeated_headers_and_footers(raw_pages)
     headings = _extract_toc_entries(pages, max_pages=toc_pages)
     if not headings:
         raise ValueError("Failed to locate table-of-contents headings in the markdown file")
