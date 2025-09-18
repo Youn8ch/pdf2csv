@@ -15,8 +15,11 @@ _TOC_PAGE_LIMIT = 20
 
 _DOTTED_LEADER_RE = re.compile(r"[.·]{2,}")
 _TOC_ENTRY_START_RE = re.compile(r"^\s*\d+(?:\.\d+)*\s+")
+_TOC_NUMBER_ONLY_RE = re.compile(r"^\s*\d+(?:\.\d+)*\s*$")
 _ENTRY_SPLIT_RE = re.compile(r"^\s*(\d+(?:\.\d+)*)\s+(.*)$")
 _NUMBERED_HEADING_RE = re.compile(r"^\d+(?:\.\d+)*\s+\S")
+_MULTILINE_HEADING_LOOKAHEAD = 4
+_SENTENCE_PUNCTUATION_RE = re.compile(r"[。！？；;,，、]")
 
 
 @dataclass
@@ -151,6 +154,25 @@ def _clean_toc_entry(raw: str) -> str | None:
     return heading
 
 
+def _looks_like_toc_entry(page: Sequence[str], line_index: int, *, window: int = 4) -> bool:
+    """Return ``True`` if the numbered ``page[line_index]`` behaves like a TOC entry."""
+
+    line = page[line_index]
+    if _DOTTED_LEADER_RE.search(line):
+        return True
+
+    limit = min(len(page), line_index + 1 + max(window, 1))
+    for idx in range(line_index + 1, limit):
+        candidate = page[idx].strip()
+        if not candidate:
+            continue
+        if _DOTTED_LEADER_RE.search(candidate):
+            return True
+        if _TOC_ENTRY_START_RE.match(candidate) or _TOC_NUMBER_ONLY_RE.match(candidate):
+            break
+    return False
+
+
 def _extract_toc_entries(
     pages: Sequence[Sequence[str]], *, max_pages: int = _TOC_PAGE_LIMIT
 ) -> tuple[list[str], tuple[int, int] | None]:
@@ -161,6 +183,16 @@ def _extract_toc_entries(
     buffer: list[str] = []
     toc_started = False
     last_position: tuple[int, int] | None = None
+
+    def flush_buffer() -> None:
+        nonlocal buffer, entries, seen
+        if not buffer:
+            return
+        entry = _clean_toc_entry(" ".join(buffer))
+        if entry and entry not in seen:
+            entries.append(entry)
+            seen.add(entry)
+        buffer = []
 
     for page_index, page in enumerate(pages):
         if page_index >= max_pages:
@@ -175,17 +207,39 @@ def _extract_toc_entries(
                 continue
             if _is_toc_marker(stripped):
                 continue
-            if _TOC_ENTRY_START_RE.match(stripped) and _DOTTED_LEADER_RE.search(stripped):
-                if buffer:
-                    entry = _clean_toc_entry(" ".join(buffer))
-                    if entry and entry not in seen:
-                        entries.append(entry)
-                        seen.add(entry)
+            is_numbered_heading = _NUMBERED_HEADING_RE.match(stripped) is not None
+            has_dotted_leader = _DOTTED_LEADER_RE.search(stripped) is not None
+
+            if is_numbered_heading and not has_dotted_leader:
+                looks_like_entry = False
+                if _TOC_ENTRY_START_RE.match(stripped) or _TOC_NUMBER_ONLY_RE.match(stripped):
+                    looks_like_entry = _looks_like_toc_entry(page, line_index)
+                if not looks_like_entry:
+                    flush_buffer()
+                    return entries, last_position
+
+            if _TOC_NUMBER_ONLY_RE.match(stripped):
+                flush_buffer()
                 buffer = [stripped]
                 last_position = (page_index, line_index)
-            elif buffer:
+                continue
+
+            if _TOC_ENTRY_START_RE.match(stripped):
+                if not _looks_like_toc_entry(page, line_index):
+                    flush_buffer()
+                    return entries, last_position
+                flush_buffer()
+                buffer = [stripped]
+                last_position = (page_index, line_index)
+                if has_dotted_leader:
+                    flush_buffer()
+                continue
+
+            if buffer:
                 buffer.append(stripped)
                 last_position = (page_index, line_index)
+                if _DOTTED_LEADER_RE.search(stripped):
+                    flush_buffer()
     if buffer:
         entry = _clean_toc_entry(" ".join(buffer))
         if entry and entry not in seen:
@@ -213,6 +267,70 @@ def _normalize_content_heading(line: str) -> str | None:
     return heading
 
 
+def _extract_heading_at(
+    lines: Sequence[str],
+    start_index: int,
+    *,
+    max_merge_lines: int = _MULTILINE_HEADING_LOOKAHEAD,
+) -> tuple[str | None, int, list[str]]:
+    """Return a heading detected at ``start_index`` along with consumed lines."""
+
+    raw_line = lines[start_index]
+    stripped = raw_line.strip()
+    if not stripped:
+        return None, 1, []
+
+    buffer: list[str] = [stripped]
+    captured: list[str] = [raw_line.rstrip()]
+
+    best_heading: str | None = _normalize_content_heading(stripped)
+    best_consumed = 1 if best_heading is not None else 0
+    best_captured: list[str] = captured.copy() if best_heading is not None else []
+    initial_heading = best_heading
+
+    if best_heading is None and not _TOC_NUMBER_ONLY_RE.match(stripped):
+        return None, 1, []
+
+    lookahead = start_index + 1
+    merges = 0
+
+    while lookahead < len(lines) and merges < max_merge_lines:
+        candidate_raw = lines[lookahead]
+        candidate_stripped = candidate_raw.strip()
+        if not candidate_stripped:
+            captured.append(candidate_raw.rstrip())
+            lookahead += 1
+            merges += 1
+            continue
+        if _NUMBERED_HEADING_RE.match(candidate_stripped):
+            break
+        if _TOC_NUMBER_ONLY_RE.match(candidate_stripped):
+            break
+        allow_extension = initial_heading is None
+        if not allow_extension:
+            break
+        if best_heading is not None and _SENTENCE_PUNCTUATION_RE.search(candidate_stripped):
+            break
+        if best_heading is not None and len(candidate_stripped) > 30:
+            break
+        buffer.append(candidate_stripped)
+        captured.append(candidate_raw.rstrip())
+        merged = " ".join(buffer)
+        normalized = _normalize_content_heading(merged)
+        merges += 1
+        if normalized is not None:
+            best_heading = normalized
+            best_consumed = lookahead - start_index + 1
+            best_captured = captured.copy()
+        lookahead += 1
+
+    if best_heading is not None:
+        consumed = max(best_consumed, 1)
+        return best_heading, consumed, best_captured
+
+    return None, 1, []
+
+
 def _collect_document_headings(
     pages: Sequence[Sequence[str]],
     *,
@@ -231,14 +349,17 @@ def _collect_document_headings(
             line_start = toc_line + 1 if page_index == toc_page else 0
         else:
             line_start = 0
-        for line_index in range(line_start, len(page)):
-            normalized = _normalize_content_heading(page[line_index])
-            if normalized is None:
-                continue
-            key = _normalize_heading_key(normalized)
-            if key not in heading_map:
-                heading_map[key] = HeadingInfo(normalized, page_index, line_index)
-                order.append(key)
+        line_index = line_start
+        while line_index < len(page):
+            normalized, consumed, _ = _extract_heading_at(page, line_index)
+            if normalized is not None:
+                key = _normalize_heading_key(normalized)
+                if key not in heading_map:
+                    heading_map[key] = HeadingInfo(normalized, page_index, line_index)
+                    order.append(key)
+                line_index += consumed
+            else:
+                line_index += 1
     return heading_map, order
 
 
@@ -330,34 +451,55 @@ def _segment_by_headings(
         return []
 
     heading_to_index: dict[str, int] = {}
+    heading_key_to_index: dict[str, int] = {}
     for idx, heading in enumerate(headings):
         heading_to_index.setdefault(heading, idx)
+        heading_key_to_index.setdefault(_normalize_heading_key(heading), idx)
 
     sections: list[str] = []
     current_lines: list[str] = []
     current_index = -1
 
     for page in pages:
-        for line in page:
+        line_index = 0
+        while line_index < len(page):
+            line = page[line_index]
             stripped = line.strip()
             if not stripped and not current_lines:
+                line_index += 1
                 continue
             if stripped == delimiter:
+                line_index += 1
                 continue
-            if not _DOTTED_LEADER_RE.search(stripped):
-                normalized = _normalize_content_heading(line)
-                if normalized is not None:
+
+            normalized, consumed, captured = _extract_heading_at(page, line_index)
+            if normalized is not None:
+                if any(_DOTTED_LEADER_RE.search(value) for value in captured if value.strip()):
+                    normalized = None
+                else:
                     target_index = heading_to_index.get(normalized)
+                    if target_index is None:
+                        target_index = heading_key_to_index.get(_normalize_heading_key(normalized))
                     if target_index is not None and target_index > current_index:
                         if current_lines:
                             section = "\n".join(_trim_trailing_blanks(current_lines))
                             if section.strip():
                                 sections.append(section)
-                        current_lines = [line.strip()]
+                        heading_lines = [value.strip() for value in captured if value.strip()]
+                        if not heading_lines:
+                            heading_lines = [page[line_index].strip()]
+                        current_lines = heading_lines.copy()
                         current_index = target_index
+                        line_index += consumed
                         continue
+
             if current_lines:
-                current_lines.append(line.rstrip())
+                if consumed > 1:
+                    for offset in range(consumed):
+                        current_lines.append(page[line_index + offset].rstrip())
+                else:
+                    current_lines.append(line.rstrip())
+            line_index += max(consumed, 1)
     if current_lines:
         section = "\n".join(_trim_trailing_blanks(current_lines))
         if section.strip():
