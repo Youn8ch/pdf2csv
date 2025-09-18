@@ -8,15 +8,18 @@ Utility scripts for extracting text from PDF documents.
 
 ## Usage
 Run the extractor directly to convert a PDF into a Markdown file where each
-page is saved under its own heading:
+page is saved under its own heading. The script scans the opening pages for a
+table of contents: any detected TOC lines are normalised into a Markdown
+bullet list at the top of the output, and pages before the TOC are dropped.
 
 ```bash
 python extract_text.py path/to/document.pdf
 ```
 
-By default the script writes `path/to/document.md` and removes the top 5% and
-bottom 5% of every page to drop fixed headers and footers. You can fine-tune
-this behaviour and other parsing settings with the available options:
+By default the script writes `path/to/document.md`, removes the top 5% and
+bottom 5% of every page to drop fixed headers/footers, and automatically keeps
+table-of-contents pages separate from the main body. You can fine-tune this
+behaviour and other parsing settings with the available options:
 
 - `--header-cutoff FLOAT` – Fraction of the page height to ignore at the top.
   Use `0` to disable header filtering. Default: `0.05` (top 5%).
@@ -26,7 +29,8 @@ this behaviour and other parsing settings with the available options:
 - `--x-tolerance FLOAT` / `--y-tolerance FLOAT` – Passed through to
   `pdfplumber` when clustering words into lines.
 - `--max-pages INT` – Only parse the first *N* pages. Helpful for debugging.
-- `--preview` – Print the extracted text for each processed page to stdout.
+- `--preview` – Print the extracted text for each processed page to stdout
+  (TOC entries are shown first when detected).
 - `--output PATH` – Write the Markdown result to a specific location (defaults
   to replacing the PDF extension with `.md`).
 

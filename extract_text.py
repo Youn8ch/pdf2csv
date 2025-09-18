@@ -1,13 +1,189 @@
 from __future__ import annotations
 
 import argparse
+import re
+import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 
 try:
     import pdfplumber
 except ImportError:  # pragma: no cover - import guard for optional dependency
     pdfplumber = None  # type: ignore[assignment]
+
+
+@dataclass
+class SplitResult:
+    """Result of splitting the PDF into table of contents and body pages."""
+
+    toc_entries: List[str]
+    content_pages: List[Tuple[int, str]]
+
+
+_TOC_KEYWORDS = {
+    "目录",
+    "目 录",
+    "CONTENTS",
+    "Contents",
+    "Table of Contents",
+    "TABLE OF CONTENTS",
+}
+
+
+def _normalise_text(value: str) -> str:
+    """Normalise whitespace and punctuation for reliable comparisons."""
+
+    collapsed = " ".join(value.replace("\u3000", " ").split())
+    collapsed = collapsed.replace("．", ".").replace("·", ".")
+    return collapsed.strip()
+
+
+def _normalise_digits(value: str) -> str:
+    """Convert full-width numerals to ASCII digits while leaving others intact."""
+
+    chars: List[str] = []
+    for char in value:
+        if "0" <= char <= "9":
+            chars.append(char)
+            continue
+        try:
+            digit = unicodedata.digit(char)
+        except (TypeError, ValueError):
+            chars.append(char)
+        else:
+            chars.append(str(digit))
+    return "".join(chars)
+
+
+def _line_looks_like_toc_entry(line: str) -> bool:
+    """Heuristic to determine whether a line resembles a TOC entry."""
+
+    cleaned = _normalise_text(_normalise_digits(line))
+    if not cleaned or len(cleaned) < 4:
+        return False
+    if cleaned.replace(" ", "") in _TOC_KEYWORDS:
+        return False
+
+    match = re.search(r"(?P<page>\d+)$", cleaned)
+    if not match:
+        return False
+
+    title = cleaned[: match.start()]
+    title = title.rstrip(". ·•")
+    title = title.strip()
+    if len(title) < 2:
+        return False
+
+    # Require either dot leaders or double spacing/tabs to reduce false positives.
+    has_alignment_hint = (
+        "..." in line
+        or ".." in line
+        or "\t" in line
+        or "  " in line
+    )
+    return has_alignment_hint
+
+
+def _extract_toc_entries(page_text: str) -> List[str]:
+    """Extract potential TOC entries from the given page text."""
+
+    entries: List[str] = []
+    seen: set[str] = set()
+
+    for raw_line in page_text.splitlines():
+        cleaned = _normalise_text(_normalise_digits(raw_line))
+        if not cleaned:
+            continue
+        if cleaned.replace(" ", "") in _TOC_KEYWORDS:
+            continue
+
+        match = re.search(r"(?P<page>\d+)$", cleaned)
+        if not match:
+            continue
+
+        page_number = match.group("page")
+        title = cleaned[: match.start()]
+        title = re.sub(r"[\.·•\s]+$", "", title).strip()
+        if len(title) < 2:
+            continue
+
+        formatted = f"{title} ...... {page_number}"
+        if formatted not in seen:
+            entries.append(formatted)
+            seen.add(formatted)
+
+    return entries
+
+
+def _is_toc_page(page_text: str, entries: List[str]) -> bool:
+    """Decide whether a page represents part of the table of contents."""
+
+    if entries:
+        return True
+
+    raw_lines = [line for line in page_text.splitlines() if line.strip()]
+    if not raw_lines:
+        return False
+
+    normalised_lines = [_normalise_text(line) for line in raw_lines]
+
+    for line in normalised_lines[:4]:
+        if line.replace(" ", "") in _TOC_KEYWORDS:
+            return True
+
+    candidate_lines = [
+        (raw, normalised)
+        for raw, normalised in zip(raw_lines, normalised_lines)
+        if re.search(r"\d", normalised)
+    ]
+    if len(candidate_lines) < 3:
+        return False
+
+    structured = sum(1 for raw, _ in candidate_lines if _line_looks_like_toc_entry(raw))
+    return structured >= max(3, int(len(candidate_lines) * 0.5))
+
+
+def split_sections(pages: List[str]) -> SplitResult:
+    """Split pages into table-of-contents entries and body content.
+
+    Pages before the detected TOC are discarded. The TOC is captured as a list
+    of formatted strings, while the remaining content is returned alongside the
+    original (1-indexed) page numbers.
+    """
+
+    toc_entries: List[str] = []
+    content_pages: List[Tuple[int, str]] = []
+    toc_started = False
+    in_toc = False
+
+    for index, page_text in enumerate(pages, start=1):
+        entries = _extract_toc_entries(page_text)
+        is_toc = _is_toc_page(page_text, entries)
+
+        if not toc_started:
+            if is_toc:
+                toc_started = True
+                in_toc = True
+                if entries:
+                    toc_entries.extend(entries)
+            else:
+                continue
+        elif in_toc:
+            if is_toc:
+                if entries:
+                    toc_entries.extend(entries)
+            else:
+                in_toc = False
+                if page_text.strip():
+                    content_pages.append((index, page_text))
+        else:
+            content_pages.append((index, page_text))
+
+    if not toc_started:
+        content_pages = [(idx, text) for idx, text in enumerate(pages, start=1) if text.strip()]
+
+    return SplitResult(toc_entries=toc_entries, content_pages=content_pages)
 
 
 def extract_text(
@@ -121,11 +297,17 @@ def extract_text(
     return pages
 
 
-def _write_markdown(pages: List[str], output_path: Path) -> None:
+def _write_markdown(result: SplitResult, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as fh:
-        for index, content in enumerate(pages, start=1):
-            fh.write(f"## Page {index}\n\n")
+        if result.toc_entries:
+            fh.write("# Table of Contents\n\n")
+            for entry in result.toc_entries:
+                fh.write(f"- {entry}\n")
+            fh.write("\n")
+
+        for page_number, content in result.content_pages:
+            fh.write(f"## Page {page_number}\n\n")
             fh.write(content)
             fh.write("\n\n")
 
@@ -200,22 +382,38 @@ def main() -> None:
         max_pages=args.max_pages,
     )
 
+    split_result = split_sections(pages)
+
     if args.preview:
-        for index, content in enumerate(pages, start=1):
-            divider = f"{'=' * 20} Page {index} {'=' * 20}"
+        if split_result.toc_entries:
+            toc_divider = "=" * 20 + " Table of Contents " + "=" * 20
+            print(toc_divider)
+            for entry in split_result.toc_entries:
+                print(entry)
+            print("=" * len(toc_divider))
+
+        for page_number, content in split_result.content_pages:
+            divider = f"{'=' * 20} Page {page_number} {'=' * 20}"
             print(divider)
             print(content)
             print("=" * len(divider))
 
     output_path = args.output or args.pdf.with_suffix(".md")
-    _write_markdown(pages, output_path)
+    _write_markdown(split_result, output_path)
 
-    page_count = len(pages)
-    print(f"Wrote {page_count} page{'s' if page_count != 1 else ''} of text to {output_path}")
+    page_count = len(split_result.content_pages)
+    print(
+        f"Wrote {page_count} page{'s' if page_count != 1 else ''} of body text to {output_path}"
+    )
+    if split_result.toc_entries:
+        toc_count = len(split_result.toc_entries)
+        print(
+            f"Captured {toc_count} TOC entr{'ies' if toc_count != 1 else 'y'} before the body."
+        )
     if args.max_pages is not None:
         print(
-            "Note: extraction stopped after"
-            f" {min(args.max_pages, page_count)} page(s) as requested."
+            "Note: extraction stopped after",
+            f" {min(args.max_pages, len(pages))} page(s) as requested.",
         )
 
 
