@@ -15,6 +15,7 @@ _TOC_PAGE_LIMIT = 20
 
 _DOTTED_LEADER_RE = re.compile(r"[.·]{2,}")
 _TOC_ENTRY_START_RE = re.compile(r"^\s*\d+(?:\.\d+)*\s+")
+_TOC_NUMBER_ONLY_RE = re.compile(r"^\s*(\d+(?:\.\d+)*)\s*$")
 _ENTRY_SPLIT_RE = re.compile(r"^\s*(\d+(?:\.\d+)*)\s+(.*)$")
 _NUMBERED_HEADING_RE = re.compile(r"^\d+(?:\.\d+)*\s+\S")
 
@@ -159,8 +160,18 @@ def _extract_toc_entries(
     entries: list[str] = []
     seen: set[str] = set()
     buffer: list[str] = []
+    split_buffer: list[str] = []
     toc_started = False
     last_position: tuple[int, int] | None = None
+
+    def flush_buffer() -> None:
+        nonlocal buffer
+        if buffer:
+            entry = _clean_toc_entry(" ".join(buffer))
+            if entry and entry not in seen:
+                entries.append(entry)
+                seen.add(entry)
+        buffer = []
 
     for page_index, page in enumerate(pages):
         if page_index >= max_pages:
@@ -175,21 +186,34 @@ def _extract_toc_entries(
                 continue
             if _is_toc_marker(stripped):
                 continue
+            number_only = _TOC_NUMBER_ONLY_RE.match(stripped)
+            if number_only:
+                flush_buffer()
+                split_buffer = [number_only.group(1)]
+                last_position = (page_index, line_index)
+                continue
+            if split_buffer:
+                if _TOC_ENTRY_START_RE.match(stripped) and _DOTTED_LEADER_RE.search(stripped):
+                    split_buffer = []
+                elif _DOTTED_LEADER_RE.search(stripped):
+                    combined = " ".join(split_buffer + [stripped])
+                    flush_buffer()
+                    buffer = [combined]
+                    split_buffer = []
+                    last_position = (page_index, line_index)
+                    continue
+                else:
+                    split_buffer.append(stripped)
+                    last_position = (page_index, line_index)
+                    continue
             if _TOC_ENTRY_START_RE.match(stripped) and _DOTTED_LEADER_RE.search(stripped):
-                if buffer:
-                    entry = _clean_toc_entry(" ".join(buffer))
-                    if entry and entry not in seen:
-                        entries.append(entry)
-                        seen.add(entry)
+                flush_buffer()
                 buffer = [stripped]
                 last_position = (page_index, line_index)
             elif buffer:
                 buffer.append(stripped)
                 last_position = (page_index, line_index)
-    if buffer:
-        entry = _clean_toc_entry(" ".join(buffer))
-        if entry and entry not in seen:
-            entries.append(entry)
+    flush_buffer()
     return entries, last_position
 
 
