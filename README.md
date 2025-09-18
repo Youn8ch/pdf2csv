@@ -11,6 +11,8 @@ Run the extractor directly to convert a PDF into a Markdown file where each
 page is saved under its own heading. The script scans the opening pages for a
 table of contents: any detected TOC lines are normalised into a Markdown
 bullet list at the top of the output, and pages before the TOC are dropped.
+Pages are only considered part of the TOC when the first ten extracted
+characters include one of the recognised keywords (e.g. “目录”, “Contents”).
 
 ```bash
 python extract_text.py path/to/document.pdf
@@ -33,6 +35,11 @@ behaviour and other parsing settings with the available options:
   (TOC entries are shown first when detected).
 - `--output PATH` – Write the Markdown result to a specific location (defaults
   to replacing the PDF extension with `.md`).
+
+In addition to the Markdown file, the script writes a sibling
+`*_目录页.txt` file containing the full text of all detected TOC pages (or a
+message if none were found). This makes it easy to review the detection output
+when tuning the header/footer filters.
 
 ### Debugging headers/footers
 While adjusting the header/footer cutoffs, combine `--preview` with

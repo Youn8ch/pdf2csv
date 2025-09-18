@@ -18,6 +18,7 @@ class SplitResult:
     """Result of splitting the PDF into table of contents and body pages."""
 
     toc_entries: List[str]
+    toc_pages: List[Tuple[int, str]]
     content_pages: List[Tuple[int, str]]
 
 
@@ -54,6 +55,44 @@ def _normalise_digits(value: str) -> str:
         else:
             chars.append(str(digit))
     return "".join(chars)
+
+
+def _page_has_toc_keyword(page_text: str) -> bool:
+    """Return True if the first characters of a page indicate a TOC heading."""
+
+    stripped = page_text.lstrip()
+    if not stripped:
+        return False
+
+    window_raw = stripped[:10]
+    window_normalised = _normalise_text(window_raw)
+    window_compact = window_normalised.replace(" ", "")
+    window_raw_cf = window_raw.casefold()
+    window_normalised_cf = window_normalised.casefold()
+    window_compact_cf = window_compact.casefold()
+
+    if not window_compact:
+        return False
+
+    for keyword in _TOC_KEYWORDS:
+        keyword_normalised = _normalise_text(keyword)
+        keyword_compact = keyword_normalised.replace(" ", "")
+        keyword_raw_cf = keyword.casefold()
+        keyword_normalised_cf = keyword_normalised.casefold()
+        keyword_compact_cf = keyword_compact.casefold()
+
+        if keyword_raw_cf in window_raw_cf:
+            return True
+        if keyword_normalised_cf and keyword_normalised_cf in window_normalised_cf:
+            return True
+        if keyword_compact_cf and keyword_compact_cf in window_compact_cf:
+            return True
+        if keyword_compact_cf and keyword_compact_cf.startswith(window_compact_cf):
+            return True
+        if window_compact_cf and window_compact_cf.startswith(keyword_compact_cf):
+            return True
+
+    return False
 
 
 def _line_looks_like_toc_entry(line: str) -> bool:
@@ -119,6 +158,9 @@ def _extract_toc_entries(page_text: str) -> List[str]:
 def _is_toc_page(page_text: str, entries: List[str]) -> bool:
     """Decide whether a page represents part of the table of contents."""
 
+    if not _page_has_toc_keyword(page_text):
+        return False
+
     if entries:
         return True
 
@@ -148,11 +190,13 @@ def split_sections(pages: List[str]) -> SplitResult:
     """Split pages into table-of-contents entries and body content.
 
     Pages before the detected TOC are discarded. The TOC is captured as a list
-    of formatted strings, while the remaining content is returned alongside the
-    original (1-indexed) page numbers.
+    of formatted strings, the raw TOC pages are preserved for inspection, and
+    the remaining content is returned alongside the original (1-indexed) page
+    numbers.
     """
 
     toc_entries: List[str] = []
+    toc_pages: List[Tuple[int, str]] = []
     content_pages: List[Tuple[int, str]] = []
     toc_started = False
     in_toc = False
@@ -165,12 +209,14 @@ def split_sections(pages: List[str]) -> SplitResult:
             if is_toc:
                 toc_started = True
                 in_toc = True
+                toc_pages.append((index, page_text))
                 if entries:
                     toc_entries.extend(entries)
             else:
                 continue
         elif in_toc:
             if is_toc:
+                toc_pages.append((index, page_text))
                 if entries:
                     toc_entries.extend(entries)
             else:
@@ -183,7 +229,9 @@ def split_sections(pages: List[str]) -> SplitResult:
     if not toc_started:
         content_pages = [(idx, text) for idx, text in enumerate(pages, start=1) if text.strip()]
 
-    return SplitResult(toc_entries=toc_entries, content_pages=content_pages)
+    return SplitResult(
+        toc_entries=toc_entries, toc_pages=toc_pages, content_pages=content_pages
+    )
 
 
 def extract_text(
@@ -312,6 +360,19 @@ def _write_markdown(result: SplitResult, output_path: Path) -> None:
             fh.write("\n\n")
 
 
+def _write_toc_pages(result: SplitResult, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as fh:
+        if not result.toc_pages:
+            fh.write("No table-of-contents pages detected.\n")
+            return
+
+        for page_number, content in result.toc_pages:
+            fh.write(f"## Page {page_number}\n")
+            fh.write(content)
+            fh.write("\n\n")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -401,6 +462,9 @@ def main() -> None:
     output_path = args.output or args.pdf.with_suffix(".md")
     _write_markdown(split_result, output_path)
 
+    toc_output = output_path.with_name(output_path.stem + "_目录页.txt")
+    _write_toc_pages(split_result, toc_output)
+
     page_count = len(split_result.content_pages)
     print(
         f"Wrote {page_count} page{'s' if page_count != 1 else ''} of body text to {output_path}"
@@ -410,6 +474,7 @@ def main() -> None:
         print(
             f"Captured {toc_count} TOC entr{'ies' if toc_count != 1 else 'y'} before the body."
         )
+    print(f"TOC pages saved to {toc_output}")
     if args.max_pages is not None:
         print(
             "Note: extraction stopped after",
