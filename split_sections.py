@@ -3,22 +3,18 @@ from __future__ import annotations
 
 import argparse
 import re
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-__all__ = ["split_sections", "export_sections", "TOCReport", "HeadingInfo", "TOCMatch"]
+__all__ = ["split_sections", "export_sections", "_extract_toc_entries", "HeadingInfo"]
 
 _DEFAULT_DELIMITER = "====="
-_TOC_PAGE_LIMIT = 20
+_TOC_PAGE_LIMIT = 50
 
 _DOTTED_LEADER_RE = re.compile(r"[.·]{2,}")
-_TOC_ENTRY_START_RE = re.compile(r"^\s*\d+(?:\.\d+)*\s+")
 _ENTRY_SPLIT_RE = re.compile(r"^\s*(\d+(?:\.\d+)*)\s+(.*)$")
-_NUMBERED_HEADING_RE = re.compile(r"^\d+(?:\.\d+)*\s+\S")
-_MULTILINE_HEADING_LOOKAHEAD = 4
-_SENTENCE_PUNCTUATION_RE = re.compile(r"[。！？；;,，、]")
+_NUMBER_ONLY_RE = re.compile(r"^\d+(?:\.\d+)*$")
 
 
 @dataclass
@@ -34,48 +30,6 @@ class HeadingInfo:
 
         return f"page {self.page_index + 1}, line {self.line_index + 1}"
 
-
-@dataclass
-class TOCMatch:
-    """Pair a table-of-contents heading with its document counterpart."""
-
-    toc_heading: str
-    document_heading: HeadingInfo
-
-
-@dataclass
-class TOCReport:
-    """Verification summary for the extracted table of contents."""
-
-    raw_headings: list[str]
-    matches: list[TOCMatch]
-    missing: list[str]
-    duplicates: list[str]
-    orphans: list[HeadingInfo]
-
-    @property
-    def validated(self) -> list[str]:
-        """Return the canonical headings confirmed to exist in the body."""
-
-        return [match.document_heading.text for match in self.matches]
-
-    @property
-    def total(self) -> int:
-        """Return the number of raw headings detected in the table of contents."""
-
-        return len(self.raw_headings)
-
-    @property
-    def validated_count(self) -> int:
-        """Return how many headings were confirmed against the document body."""
-
-        return len(self.matches)
-
-    @property
-    def has_issues(self) -> bool:
-        """Return ``True`` when verification uncovered inconsistencies."""
-
-        return bool(self.missing or self.duplicates or self.orphans)
 
 def _ensure_markdown_suffix(path: Path) -> Path:
     """Return ``path`` with a ``.md`` suffix, replacing any existing suffix."""
@@ -104,16 +58,16 @@ def _read_pages(path: Path) -> list[list[str]]:
     return pages
 
 
-def _normalize_marker(text: str) -> str:
-    """Collapse whitespace in ``text`` for easier marker comparisons."""
-
-    return re.sub(r"\s+", "", text.replace("\u3000", ""))
-
-
 def _normalize_spaces(text: str) -> str:
     """Collapse repeated whitespace characters in ``text``."""
 
     return re.sub(r"\s+", " ", text.replace("\u3000", " ")).strip()
+
+
+def _normalize_marker(text: str) -> str:
+    """Collapse whitespace in ``text`` for easier marker comparisons."""
+
+    return re.sub(r"\s+", "", text.replace("\u3000", ""))
 
 
 def _normalize_heading_key(text: str) -> str:
@@ -130,46 +84,18 @@ def _is_toc_marker(text: str) -> bool:
     """Return ``True`` if ``text`` marks the beginning of the table of contents."""
 
     normalized = _normalize_marker(text)
-    return normalized in {"目录", "目錄"}
+    return normalized.lower() in {"目录", "目錄", "contents"}
 
 
-def _clean_toc_entry(raw: str) -> str | None:
-    """Normalise a raw table-of-contents entry into a heading string."""
+def _clean_toc_text(text: str) -> str:
+    """Normalise table-of-contents text by removing dotted leaders and page numbers."""
 
-    candidate = raw.replace("\u3000", " ")
-    match = _ENTRY_SPLIT_RE.match(candidate)
-    if not match:
-        return None
-    label, title = match.groups()
-    title = re.sub(r"[.·]{2,}.*$", "", title)
-    title = re.sub(r"\s+\d+\s*$", "", title)
-    title = _normalize_spaces(title)
-    title = re.sub(r"[:：]\s*$", "", title).rstrip()
-    if not title:
-        return None
-    heading = f"{label} {title}"
-    if not _NUMBERED_HEADING_RE.match(heading):
-        return None
-    return heading
-
-
-def _looks_like_toc_entry(page: Sequence[str], line_index: int, *, window: int = 4) -> bool:
-    """Return ``True`` if the numbered ``page[line_index]`` behaves like a TOC entry."""
-
-    line = page[line_index]
-    if _DOTTED_LEADER_RE.search(line):
-        return True
-
-    limit = min(len(page), line_index + 1 + max(window, 1))
-    for idx in range(line_index + 1, limit):
-        candidate = page[idx].strip()
-        if not candidate:
-            continue
-        if _DOTTED_LEADER_RE.search(candidate):
-            return True
-        if _TOC_ENTRY_START_RE.match(candidate) or _TOC_NUMBER_ONLY_RE.match(candidate):
-            break
-    return False
+    candidate = text.replace("\u3000", " ")
+    has_dots = bool(_DOTTED_LEADER_RE.search(candidate))
+    candidate = _DOTTED_LEADER_RE.sub(" ", candidate)
+    if has_dots:
+        candidate = re.sub(r"\s+\d+\s*$", "", candidate)
+    return _normalize_spaces(candidate)
 
 
 def _extract_toc_entries(
@@ -178,17 +104,40 @@ def _extract_toc_entries(
     """Return headings discovered in the table of contents and the last TOC position."""
 
     entries: list[str] = []
-    seen: set[str] = set()
-    buffer: list[str] = []
-    split_buffer: list[str] = []
     toc_started = False
+    toc_entries_found = False
+    current_label: str | None = None
+    current_parts: list[str] = []
     last_position: tuple[int, int] | None = None
+
+    def finalize() -> None:
+        nonlocal current_label, current_parts, toc_entries_found
+        if current_label and current_parts:
+            title = _normalize_spaces(" ".join(current_parts))
+            if title:
+                entries.append(f"{current_label} {title}")
+                toc_entries_found = True
+        current_label = None
+        current_parts = []
 
     for page_index, page in enumerate(pages):
         if page_index >= max_pages:
             break
-        for line_index, line in enumerate(page):
-            stripped = line.strip()
+
+        marker_in_page = any(_is_toc_marker(line.strip()) for line in page)
+        page_has_dots = any(_DOTTED_LEADER_RE.search(line) for line in page)
+
+        if not toc_started:
+            if not marker_in_page:
+                continue
+            toc_started = True
+
+        if toc_entries_found and not page_has_dots:
+            finalize()
+            break
+
+        for line_index, raw_line in enumerate(page):
+            stripped = raw_line.strip()
             if not stripped:
                 continue
             if not toc_started:
@@ -197,310 +146,209 @@ def _extract_toc_entries(
                 continue
             if _is_toc_marker(stripped):
                 continue
-            if _TOC_ENTRY_START_RE.match(stripped) and _DOTTED_LEADER_RE.search(stripped):
-                if buffer:
-                    entry = _clean_toc_entry(" ".join(buffer))
-                    if entry and entry not in seen:
-                        entries.append(entry)
-                        seen.add(entry)
-                buffer = [stripped]
+
+            match = _ENTRY_SPLIT_RE.match(stripped)
+            if match:
+                finalize()
+                label, rest = match.groups()
+                current_label = label
+                current_parts = []
+                cleaned = _clean_toc_text(rest)
+                if cleaned:
+                    current_parts.append(cleaned)
                 last_position = (page_index, line_index)
-                if has_dotted_leader:
-                    flush_buffer()
                 continue
 
-            if buffer:
-                buffer.append(stripped)
+            if _NUMBER_ONLY_RE.match(stripped):
+                finalize()
+                current_label = stripped
+                current_parts = []
                 last_position = (page_index, line_index)
-    if buffer:
-        entry = _clean_toc_entry(" ".join(buffer))
-        if entry and entry not in seen:
-            entries.append(entry)
+                continue
+
+            if current_label is not None:
+                cleaned = _clean_toc_text(stripped)
+                if cleaned:
+                    current_parts.append(cleaned)
+                    last_position = (page_index, line_index)
+                continue
+
+        if toc_started and current_label is not None and not page_has_dots:
+            finalize()
+            break
+
+    finalize()
     return entries, last_position
 
+def _write_toc_debug(headings: Sequence[str], markdown_path: Path) -> Path:
+    """Write extracted TOC headings to a sibling ``*_toc.txt`` file."""
 
-def _normalize_content_heading(line: str) -> str | None:
-    """Return a normalised heading from a document line."""
-
-    candidate = line.replace("\u3000", " ").strip()
-    match = _ENTRY_SPLIT_RE.match(candidate)
-    if not match:
-        return None
-    label, title = match.groups()
-    title = re.sub(r"[.·]{2,}.*$", "", title)
-    title = re.sub(r"\s+\d+\s*$", "", title)
-    title = _normalize_spaces(title)
-    title = re.sub(r"[:：]\s*$", "", title).rstrip()
-    if not title:
-        return None
-    heading = f"{label} {title}"
-    if not _NUMBERED_HEADING_RE.match(heading):
-        return None
-    return heading
+    debug_path = markdown_path.with_name(markdown_path.stem + "_toc.txt")
+    if headings:
+        content = "\n".join(headings) + "\n"
+    else:
+        content = "No table-of-contents headings detected.\n"
+    debug_path.write_text(content, encoding="utf-8")
+    return debug_path
 
 
-def _extract_heading_at(
-    lines: Sequence[str],
-    start_index: int,
-    *,
-    max_merge_lines: int = _MULTILINE_HEADING_LOOKAHEAD,
-) -> tuple[str | None, int, list[str]]:
-    """Return a heading detected at ``start_index`` along with consumed lines."""
+def _flatten_body_lines(
+    pages: Sequence[Sequence[str]], start_after: tuple[int, int] | None
+) -> tuple[list[str], dict[tuple[int, int], int]]:
+    """Return body lines after the TOC and a lookup from location to line index."""
 
-    raw_line = lines[start_index]
-    stripped = raw_line.strip()
-    if not stripped:
-        return None, 1, []
+    body_lines: list[str] = []
+    position_to_index: dict[tuple[int, int], int] = {}
 
-    buffer: list[str] = [stripped]
-    captured: list[str] = [raw_line.rstrip()]
-
-    best_heading: str | None = _normalize_content_heading(stripped)
-    best_consumed = 1 if best_heading is not None else 0
-    best_captured: list[str] = captured.copy() if best_heading is not None else []
-    initial_heading = best_heading
-
-    if best_heading is None and not _TOC_NUMBER_ONLY_RE.match(stripped):
-        return None, 1, []
-
-    lookahead = start_index + 1
-    merges = 0
-
-    while lookahead < len(lines) and merges < max_merge_lines:
-        candidate_raw = lines[lookahead]
-        candidate_stripped = candidate_raw.strip()
-        if not candidate_stripped:
-            captured.append(candidate_raw.rstrip())
-            lookahead += 1
-            merges += 1
-            continue
-        if _NUMBERED_HEADING_RE.match(candidate_stripped):
-            break
-        if _TOC_NUMBER_ONLY_RE.match(candidate_stripped):
-            break
-        allow_extension = initial_heading is None
-        if not allow_extension:
-            break
-        if best_heading is not None and _SENTENCE_PUNCTUATION_RE.search(candidate_stripped):
-            break
-        if best_heading is not None and len(candidate_stripped) > 30:
-            break
-        buffer.append(candidate_stripped)
-        captured.append(candidate_raw.rstrip())
-        merged = " ".join(buffer)
-        normalized = _normalize_content_heading(merged)
-        merges += 1
-        if normalized is not None:
-            best_heading = normalized
-            best_consumed = lookahead - start_index + 1
-            best_captured = captured.copy()
-        lookahead += 1
-
-    if best_heading is not None:
-        consumed = max(best_consumed, 1)
-        return best_heading, consumed, best_captured
-
-    return None, 1, []
-
-
-def _collect_document_headings(
-    pages: Sequence[Sequence[str]],
-    *,
-    start_after: tuple[int, int] | None,
-) -> tuple[dict[str, HeadingInfo], list[str]]:
-    """Return body headings after ``start_after`` as a mapping and ordered keys."""
-
-    heading_map: dict[str, HeadingInfo] = {}
-    order: list[str] = []
+    start_page = start_after[0] if start_after else 0
+    start_line = start_after[1] + 1 if start_after else 0
 
     for page_index, page in enumerate(pages):
-        if start_after is not None:
-            toc_page, toc_line = start_after
-            if page_index < toc_page:
-                continue
-            line_start = toc_line + 1 if page_index == toc_page else 0
-        else:
-            line_start = 0
-        line_index = line_start
-        while line_index < len(page):
-            normalized, consumed, _ = _extract_heading_at(page, line_index)
-            if normalized is not None:
-                key = _normalize_heading_key(normalized)
-                if key not in heading_map:
-                    heading_map[key] = HeadingInfo(normalized, page_index, line_index)
-                    order.append(key)
-                line_index += consumed
-            else:
-                line_index += 1
-    return heading_map, order
-
-
-def _verify_toc_against_body(
-    toc_headings: Sequence[str],
-    heading_map: dict[str, HeadingInfo],
-    heading_order: Sequence[str],
-) -> TOCReport:
-    """Cross-check table-of-contents headings against document headings."""
-
-    matches: list[TOCMatch] = []
-    missing: list[str] = []
-    duplicates: list[str] = []
-    seen_keys: set[str] = set()
-
-    for heading in toc_headings:
-        key = _normalize_heading_key(heading)
-        if key in seen_keys:
-            duplicates.append(heading)
+        if page_index < start_page:
             continue
-        seen_keys.add(key)
-        info = heading_map.get(key)
-        if info is None:
-            missing.append(heading)
-            continue
-        matches.append(TOCMatch(heading, info))
-
-    toc_key_set = set(_normalize_heading_key(h) for h in toc_headings)
-    orphans = [heading_map[key] for key in heading_order if key not in toc_key_set]
-
-    return TOCReport(
-        raw_headings=list(toc_headings),
-        matches=matches,
-        missing=missing,
-        duplicates=duplicates,
-        orphans=orphans,
-    )
+        line_start = start_line if page_index == start_page else 0
+        for line_index in range(line_start, len(page)):
+            position_to_index[(page_index, line_index)] = len(body_lines)
+            body_lines.append(page[line_index])
+    return body_lines, position_to_index
 
 
-def _print_toc_report(report: TOCReport, *, stream=sys.stderr, limit: int = 10) -> None:
-    """Emit a short verification summary for ``report`` to ``stream``."""
-
-    print(
-        f"TOC entries detected: {report.total}; validated in body: {report.validated_count}",
-        file=stream,
-    )
-    if report.missing:
-        print("Missing in body:", file=stream)
-        for heading in report.missing[:limit]:
-            print(f"  - {heading}", file=stream)
-        if len(report.missing) > limit:
-            remaining = len(report.missing) - limit
-            print(f"  … {remaining} more", file=stream)
-    if report.duplicates:
-        print("Duplicate entries in TOC:", file=stream)
-        for heading in report.duplicates[:limit]:
-            print(f"  - {heading}", file=stream)
-        if len(report.duplicates) > limit:
-            remaining = len(report.duplicates) - limit
-            print(f"  … {remaining} more", file=stream)
-    if report.orphans:
-        print("Headings seen in body but missing from TOC:", file=stream)
-        for info in report.orphans[:limit]:
-            print(f"  - {info.text} ({info.location_label()})", file=stream)
-        if len(report.orphans) > limit:
-            remaining = len(report.orphans) - limit
-            print(f"  … {remaining} more", file=stream)
-        print("Hint: increase --toc-pages to scan additional pages if these headings belong in the TOC.", file=stream)
-
-
-def _trim_trailing_blanks(lines: Sequence[str]) -> list[str]:
-    """Remove trailing blank lines from ``lines``."""
-
-    trimmed = list(lines)
-    while trimmed and not trimmed[-1].strip():
-        trimmed.pop()
-    return trimmed
-
-
-def _segment_by_headings(
+def _collect_heading_infos(
     pages: Sequence[Sequence[str]],
-    headings: Sequence[str],
-    *,
-    delimiter: str,
-) -> list[str]:
-    """Split the document into sections using the discovered headings."""
+    start_after: tuple[int, int] | None,
+    toc_headings: Sequence[str],
+) -> dict[str, HeadingInfo]:
+    """Collect document headings appearing after ``start_after``."""
 
-    if not headings:
+    target_keys = {_normalize_heading_key(heading) for heading in toc_headings}
+    heading_map: dict[str, HeadingInfo] = {}
+
+    current_label: str | None = None
+    current_parts: list[str] = []
+    current_page: int | None = None
+    current_line: int | None = None
+
+    def record_current_if_target() -> None:
+        nonlocal current_label, current_parts, current_page, current_line
+        if (
+            current_label
+            and current_parts
+            and current_page is not None
+            and current_line is not None
+        ):
+            title = _normalize_spaces(" ".join(current_parts))
+            if title:
+                heading = f"{current_label} {title}"
+                key = _normalize_heading_key(heading)
+                if key in target_keys and key not in heading_map:
+                    heading_map[key] = HeadingInfo(heading, current_page, current_line)
+                    current_label = None
+                    current_parts = []
+                    current_page = None
+                    current_line = None
+
+    def finalize() -> None:
+        nonlocal current_label, current_parts, current_page, current_line
+        record_current_if_target()
+        current_label = None
+        current_parts = []
+        current_page = None
+        current_line = None
+
+    start_page = start_after[0] if start_after else 0
+
+    for page_index, page in enumerate(pages):
+        if page_index < start_page:
+            continue
+        line_index = 0
+        if start_after and page_index == start_page:
+            line_index = start_after[1] + 1
+        while line_index < len(page):
+            raw_line = page[line_index]
+            stripped = raw_line.strip()
+            if not stripped:
+                finalize()
+                line_index += 1
+                continue
+
+            match = _ENTRY_SPLIT_RE.match(stripped)
+            if match:
+                finalize()
+                label, rest = match.groups()
+                current_label = label
+                current_parts = []
+                cleaned = _clean_toc_text(rest)
+                if cleaned:
+                    current_parts.append(cleaned)
+                current_page = page_index
+                current_line = line_index
+                record_current_if_target()
+                line_index += 1
+                continue
+
+            if _NUMBER_ONLY_RE.match(stripped):
+                finalize()
+                current_label = stripped
+                current_parts = []
+                current_page = page_index
+                current_line = line_index
+                line_index += 1
+                continue
+
+            if current_label is not None:
+                cleaned = _clean_toc_text(stripped)
+                if cleaned:
+                    current_parts.append(cleaned)
+                    record_current_if_target()
+                line_index += 1
+                continue
+
+            line_index += 1
+
+    finalize()
+    return heading_map
+
+def _split_body_by_headings(
+    pages: Sequence[Sequence[str]],
+    toc_headings: Sequence[str],
+    start_after: tuple[int, int] | None,
+) -> list[str]:
+    """Split the document body into sections based on matched TOC headings."""
+
+    if not toc_headings:
         return []
 
-    heading_to_index: dict[str, int] = {}
-    heading_key_to_index: dict[str, int] = {}
-    for idx, heading in enumerate(headings):
-        heading_to_index.setdefault(heading, idx)
-        heading_key_to_index.setdefault(_normalize_heading_key(heading), idx)
+    body_lines, position_to_index = _flatten_body_lines(pages, start_after)
+    heading_map = _collect_heading_infos(pages, start_after, toc_headings)
+
+    ordered_indices: list[tuple[int, HeadingInfo]] = []
+    for heading in toc_headings:
+        key = _normalize_heading_key(heading)
+        info = heading_map.get(key)
+        if info is None:
+            continue
+        global_index = position_to_index.get((info.page_index, info.line_index))
+        if global_index is None:
+            continue
+        ordered_indices.append((global_index, info))
+
+    if not ordered_indices:
+        return []
+
+    ordered_indices.sort(key=lambda pair: pair[0])
 
     sections: list[str] = []
-    current_lines: list[str] = []
-    current_index = -1
-
-    for page in pages:
-        line_index = 0
-        while line_index < len(page):
-            line = page[line_index]
-            stripped = line.strip()
-            if not stripped and not current_lines:
-                line_index += 1
-                continue
-            if stripped == delimiter:
-                line_index += 1
-                continue
-
-            normalized, consumed, captured = _extract_heading_at(page, line_index)
-            if normalized is not None:
-                if any(_DOTTED_LEADER_RE.search(value) for value in captured if value.strip()):
-                    normalized = None
-                else:
-                    target_index = heading_to_index.get(normalized)
-                    if target_index is None:
-                        target_index = heading_key_to_index.get(_normalize_heading_key(normalized))
-                    if target_index is not None and target_index > current_index:
-                        if current_lines:
-                            section = "\n".join(_trim_trailing_blanks(current_lines))
-                            if section.strip():
-                                sections.append(section)
-                        heading_lines = [value.strip() for value in captured if value.strip()]
-                        if not heading_lines:
-                            heading_lines = [page[line_index].strip()]
-                        current_lines = heading_lines.copy()
-                        current_index = target_index
-                        line_index += consumed
-                        continue
-
-            if current_lines:
-                if consumed > 1:
-                    for offset in range(consumed):
-                        current_lines.append(page[line_index + offset].rstrip())
-                else:
-                    current_lines.append(line.rstrip())
-            line_index += max(consumed, 1)
-    if current_lines:
-        section = "\n".join(_trim_trailing_blanks(current_lines))
-        if section.strip():
-            sections.append(section)
+    for idx, (start_idx, _info) in enumerate(ordered_indices):
+        end_idx = ordered_indices[idx + 1][0] if idx + 1 < len(ordered_indices) else len(body_lines)
+        lines = body_lines[start_idx:end_idx]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        section_text = "\n".join(lines).strip("\n")
+        if section_text:
+            sections.append(section_text)
     return sections
-
-
-def _load_pages_and_headings(
-    markdown_path: str | Path,
-    *,
-    toc_pages: int,
-) -> tuple[list[list[str]], TOCReport]:
-    """Return document pages and a verified table-of-contents report."""
-
-    path = Path(markdown_path)
-    if not path.exists():
-        raise FileNotFoundError(path)
-    if path.suffix.lower() != ".md":
-        raise ValueError(f"split_sections expects a .md file, got {path}")
-
-    pages = _read_pages(path)
-    toc_headings, toc_last_position = _extract_toc_entries(pages, max_pages=toc_pages)
-    if not toc_headings:
-        raise ValueError("Failed to locate table-of-contents headings in the markdown file")
-    heading_map, heading_order = _collect_document_headings(pages, start_after=toc_last_position)
-    report = _verify_toc_against_body(toc_headings, heading_map, heading_order)
-    if not report.matches:
-        raise ValueError("No table-of-contents headings could be validated against the document body")
-    return pages, report
 
 
 def export_sections(
@@ -528,8 +376,22 @@ def split_sections(
 ) -> list[str]:
     """Split the markdown manual into sections based on table-of-contents entries."""
 
-    pages, report = _load_pages_and_headings(markdown_path, toc_pages=toc_pages)
-    return _segment_by_headings(pages, report.validated, delimiter=delimiter)
+    path = Path(markdown_path)
+    if not path.exists():
+        raise FileNotFoundError(path)
+    if path.suffix.lower() != ".md":
+        raise ValueError(f"split_sections expects a .md file, got {path}")
+
+    pages = _read_pages(path)
+    toc_headings, toc_last_position = _extract_toc_entries(pages, max_pages=toc_pages)
+    if not toc_headings:
+        raise ValueError("Failed to locate table-of-contents headings in the markdown file")
+    if toc_last_position is None:
+        raise ValueError("Failed to determine where the table of contents ends")
+
+    _write_toc_debug(toc_headings, path)
+
+    return _split_body_by_headings(pages, toc_headings, toc_last_position)
 
 
 def _preview(section: str, limit: int = 20) -> str:
@@ -581,19 +443,22 @@ def main(argv: Sequence[str] | None = None) -> None:  # pragma: no cover - CLI h
     )
     args = parser.parse_args(argv)
 
-    pages, report = _load_pages_and_headings(args.markdown, toc_pages=args.toc_pages)
-    headings = report.validated
+    pages = _read_pages(args.markdown)
+    toc_headings, toc_last_position = _extract_toc_entries(pages, max_pages=args.toc_pages)
+    if not toc_headings:
+        parser.error("Failed to locate table-of-contents headings in the markdown file")
+    if toc_last_position is None:
+        parser.error("Failed to determine where the table of contents ends")
+
+    debug_path = _write_toc_debug(toc_headings, args.markdown)
 
     if args.print_toc:
-        for match in report.matches:
-            print(match.document_heading.text)
-        _print_toc_report(report)
+        for heading in toc_headings:
+            print(heading)
+        print(f"TOC headings written to {debug_path}")
         return
 
-    if report.has_issues:
-        _print_toc_report(report)
-
-    sections = _segment_by_headings(pages, headings, delimiter=args.delimiter)
+    sections = _split_body_by_headings(pages, toc_headings, toc_last_position)
     print(f"Detected {len(sections)} sections in {args.markdown}")
 
     if not args.no_export:
