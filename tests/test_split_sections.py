@@ -84,6 +84,7 @@ def test_split_sections_generates_debug_toc(tmp_path: Path) -> None:
     ]
 
 
+
 def test_split_sections_avoids_cross_reference_headings(tmp_path: Path) -> None:
     """Text that references another heading should not trigger a new section."""
 
@@ -123,3 +124,4 @@ def test_split_sections_avoids_cross_reference_headings(tmp_path: Path) -> None:
     assert "请参见下一节" in sections[0]
     assert "第二节的正文内容" in sections[1]
     assert "请参见下一节" not in sections[1]
+

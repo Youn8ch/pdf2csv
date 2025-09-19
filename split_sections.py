@@ -193,7 +193,6 @@ def _write_toc_debug(headings: Sequence[str], markdown_path: Path) -> Path:
     debug_path.write_text(content, encoding="utf-8")
     return debug_path
 
-
 def _flatten_body_lines(
     pages: Sequence[Sequence[str]], start_after: tuple[int, int] | None
 ) -> tuple[list[str], dict[tuple[int, int], int]]:
@@ -405,6 +404,7 @@ def _split_body_by_headings(
         score = _heading_context_score(pages, info)
         candidate_map.setdefault(key, deque()).append((global_index, score, info))
 
+
     ordered_indices: list[tuple[int, HeadingInfo]] = []
     last_index = -1
     for heading in toc_headings:
@@ -412,7 +412,6 @@ def _split_body_by_headings(
         queue = candidate_map.get(key)
         if not queue:
             continue
-
         while queue and queue[0][0] <= last_index:
             queue.popleft()
         if not queue:
@@ -447,7 +446,6 @@ def _split_body_by_headings(
         if section_text:
             sections.append(section_text)
     return sections
-
 
 def export_sections(
     sections: Sequence[str],
