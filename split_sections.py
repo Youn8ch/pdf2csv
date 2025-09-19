@@ -193,6 +193,7 @@ def _write_toc_debug(headings: Sequence[str], markdown_path: Path) -> Path:
     debug_path.write_text(content, encoding="utf-8")
     return debug_path
 
+
 def _flatten_body_lines(
     pages: Sequence[Sequence[str]], start_after: tuple[int, int] | None
 ) -> tuple[list[str], dict[tuple[int, int], int]]:
@@ -349,6 +350,7 @@ def _collect_heading_occurrences(
                 cleaned = _clean_toc_text(rest)
                 if cleaned:
                     current_parts.append(cleaned)
+
                 current_page = page_index
                 current_line = line_index
                 current_last_line = line_index
@@ -407,32 +409,60 @@ def _split_body_by_headings(
 
     ordered_indices: list[tuple[int, HeadingInfo]] = []
     last_index = -1
+    # Headings must be matched sequentially; once a TOC entry cannot be
+    # resolved after the previous match we stop splitting to avoid jumping
+    # ahead and producing misordered sections.
     for heading in toc_headings:
         key = _normalize_heading_key(heading)
         queue = candidate_map.get(key)
         if not queue:
-            continue
+            break
+
         while queue and queue[0][0] <= last_index:
             queue.popleft()
         if not queue:
-            continue
+            break
 
-        best_pos = 0
-        best_index, best_score, best_info = queue[0]
+
+        best_pos: int | None = None
+        best_index = -1
+        best_score = float("-inf")
+        chosen_info: HeadingInfo | None = None
         for idx, (global_index, score, info) in enumerate(queue):
             if global_index <= last_index:
                 continue
-            if score > best_score or (score == best_score and global_index > best_index):
+            if (
+                best_pos is None
+                or score > best_score
+                or (score == best_score and global_index < best_index)
+            ):
                 best_pos = idx
                 best_index = global_index
                 best_score = score
-                best_info = info
+                chosen_info = info
+
+        if best_pos is None or chosen_info is None:
+            break
 
         for _ in range(best_pos):
             queue.popleft()
-        start_idx, _score, chosen_info = queue.popleft()
+        start_idx, _score, _ = queue.popleft()
         last_index = start_idx
         ordered_indices.append((start_idx, chosen_info))
+
+    sections: list[str] = []
+    for idx, (start_idx, _info) in enumerate(ordered_indices):
+        end_idx = ordered_indices[idx + 1][0] if idx + 1 < len(ordered_indices) else len(body_lines)
+        lines = body_lines[start_idx:end_idx]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        section_text = "\n".join(lines).strip("\n")
+        if section_text:
+            sections.append(section_text)
+    return sections
+
 
     sections: list[str] = []
     for idx, (start_idx, _info) in enumerate(ordered_indices):
