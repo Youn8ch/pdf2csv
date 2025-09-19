@@ -350,6 +350,7 @@ def _collect_heading_occurrences(
                 cleaned = _clean_toc_text(rest)
                 if cleaned:
                     current_parts.append(cleaned)
+
                 current_page = page_index
                 current_line = line_index
                 current_last_line = line_index
@@ -405,6 +406,7 @@ def _split_body_by_headings(
         score = _heading_context_score(pages, info)
         candidate_map.setdefault(key, deque()).append((global_index, score, info))
 
+
     ordered_indices: list[tuple[int, HeadingInfo]] = []
     last_index = -1
     # Headings must be matched sequentially; once a TOC entry cannot be
@@ -420,6 +422,7 @@ def _split_body_by_headings(
             queue.popleft()
         if not queue:
             break
+
 
         best_pos: int | None = None
         best_index = -1
@@ -460,6 +463,19 @@ def _split_body_by_headings(
             sections.append(section_text)
     return sections
 
+
+    sections: list[str] = []
+    for idx, (start_idx, _info) in enumerate(ordered_indices):
+        end_idx = ordered_indices[idx + 1][0] if idx + 1 < len(ordered_indices) else len(body_lines)
+        lines = body_lines[start_idx:end_idx]
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        section_text = "\n".join(lines).strip("\n")
+        if section_text:
+            sections.append(section_text)
+    return sections
 
 def export_sections(
     sections: Sequence[str],
