@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import re
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -24,6 +25,7 @@ class HeadingInfo:
     text: str
     page_index: int
     line_index: int
+    end_line_index: int
 
     def location_label(self) -> str:
         """Return a human-friendly ``page/line`` label for debugging."""
@@ -191,7 +193,6 @@ def _write_toc_debug(headings: Sequence[str], markdown_path: Path) -> Path:
     debug_path.write_text(content, encoding="utf-8")
     return debug_path
 
-
 def _flatten_body_lines(
     pages: Sequence[Sequence[str]], start_after: tuple[int, int] | None
 ) -> tuple[list[str], dict[tuple[int, int], int]]:
@@ -213,23 +214,93 @@ def _flatten_body_lines(
     return body_lines, position_to_index
 
 
-def _collect_heading_infos(
+def _next_nonempty_line(
+    pages: Sequence[Sequence[str]], page_index: int, line_index: int
+) -> tuple[int, int, str] | None:
+    """Return the next non-empty line after ``page_index``/``line_index``."""
+
+    for current_page in range(page_index, len(pages)):
+        start = line_index + 1 if current_page == page_index else 0
+        page = pages[current_page]
+        for idx in range(start, len(page)):
+            text = page[idx].strip()
+            if text:
+                return current_page, idx, text
+        line_index = -1
+    return None
+
+
+def _previous_nonempty_line(
+    pages: Sequence[Sequence[str]], page_index: int, line_index: int
+) -> tuple[int, int, str] | None:
+    """Return the previous non-empty line before ``page_index``/``line_index``."""
+
+    for current_page in range(page_index, -1, -1):
+        end = line_index if current_page == page_index else len(pages[current_page])
+        page = pages[current_page]
+        for idx in range(end - 1, -1, -1):
+            text = page[idx].strip()
+            if text:
+                return current_page, idx, text
+        line_index = len(page)
+    return None
+
+
+def _heading_context_score(pages: Sequence[Sequence[str]], info: HeadingInfo) -> int:
+    """Return a heuristic score describing how ``info`` fits typical section context."""
+
+    score = 0
+
+    next_line = _next_nonempty_line(pages, info.page_index, info.end_line_index)
+    if next_line is not None:
+        _, _, text = next_line
+        normalized = text.strip()
+        lower = normalized.lower()
+        if normalized.startswith("步骤") or lower.startswith("step"):
+            score -= 2
+        if normalized.startswith("参见") or normalized.startswith("详见") or lower.startswith("see"):
+            score -= 2
+        if normalized and normalized[0].isdigit():
+            score -= 1
+        if normalized and normalized[0] in {"●", "▪", "-", "–"}:
+            score -= 1
+        if any(keyword in normalized for keyword in ("告警", "简介", "概述", "说明", "介绍", "场景", "流程", "功能", "目的")):
+            score += 1
+
+    previous_line = _previous_nonempty_line(pages, info.page_index, info.line_index)
+    if previous_line is not None:
+        _, _, text = previous_line
+        normalized = text.strip()
+        lower = normalized.lower()
+        if normalized.endswith("：") or lower.endswith(":"):
+            score -= 1
+        if "参见" in normalized or lower.startswith("see"):
+            score -= 1
+
+    return score
+
+
+def _collect_heading_occurrences(
     pages: Sequence[Sequence[str]],
     start_after: tuple[int, int] | None,
     toc_headings: Sequence[str],
-) -> dict[str, HeadingInfo]:
-    """Collect document headings appearing after ``start_after``."""
+) -> list[tuple[str, HeadingInfo]]:
+    """Collect document heading occurrences appearing after ``start_after``."""
 
     target_keys = {_normalize_heading_key(heading) for heading in toc_headings}
-    heading_map: dict[str, HeadingInfo] = {}
+    if not target_keys:
+        return []
+
+    occurrences: list[tuple[str, HeadingInfo]] = []
 
     current_label: str | None = None
     current_parts: list[str] = []
     current_page: int | None = None
     current_line: int | None = None
+    current_last_line: int | None = None
 
     def record_current_if_target() -> None:
-        nonlocal current_label, current_parts, current_page, current_line
+        nonlocal current_label, current_parts, current_page, current_line, current_last_line
         if (
             current_label
             and current_parts
@@ -240,20 +311,18 @@ def _collect_heading_infos(
             if title:
                 heading = f"{current_label} {title}"
                 key = _normalize_heading_key(heading)
-                if key in target_keys and key not in heading_map:
-                    heading_map[key] = HeadingInfo(heading, current_page, current_line)
-                    current_label = None
-                    current_parts = []
-                    current_page = None
-                    current_line = None
+                if key in target_keys:
+                    end_line = current_last_line if current_last_line is not None else current_line
+                    occurrences.append((key, HeadingInfo(heading, current_page, current_line, end_line)))
 
     def finalize() -> None:
-        nonlocal current_label, current_parts, current_page, current_line
+        nonlocal current_label, current_parts, current_page, current_line, current_last_line
         record_current_if_target()
         current_label = None
         current_parts = []
         current_page = None
         current_line = None
+        current_last_line = None
 
     start_page = start_after[0] if start_after else 0
 
@@ -282,6 +351,7 @@ def _collect_heading_infos(
                     current_parts.append(cleaned)
                 current_page = page_index
                 current_line = line_index
+                current_last_line = line_index
                 record_current_if_target()
                 line_index += 1
                 continue
@@ -292,6 +362,8 @@ def _collect_heading_infos(
                 current_parts = []
                 current_page = page_index
                 current_line = line_index
+                current_last_line = line_index
+                record_current_if_target()
                 line_index += 1
                 continue
 
@@ -299,6 +371,7 @@ def _collect_heading_infos(
                 cleaned = _clean_toc_text(stripped)
                 if cleaned:
                     current_parts.append(cleaned)
+                    current_last_line = line_index
                     record_current_if_target()
                 line_index += 1
                 continue
@@ -306,7 +379,7 @@ def _collect_heading_infos(
             line_index += 1
 
     finalize()
-    return heading_map
+    return occurrences
 
 def _split_body_by_headings(
     pages: Sequence[Sequence[str]],
@@ -319,23 +392,47 @@ def _split_body_by_headings(
         return []
 
     body_lines, position_to_index = _flatten_body_lines(pages, start_after)
-    heading_map = _collect_heading_infos(pages, start_after, toc_headings)
+    occurrences = _collect_heading_occurrences(pages, start_after, toc_headings)
+    if not occurrences:
+        return []
 
-    ordered_indices: list[tuple[int, HeadingInfo]] = []
-    for heading in toc_headings:
-        key = _normalize_heading_key(heading)
-        info = heading_map.get(key)
-        if info is None:
-            continue
+    candidate_map: dict[str, deque[tuple[int, int, HeadingInfo]]] = {}
+    for key, info in occurrences:
         global_index = position_to_index.get((info.page_index, info.line_index))
         if global_index is None:
             continue
-        ordered_indices.append((global_index, info))
+        score = _heading_context_score(pages, info)
+        candidate_map.setdefault(key, deque()).append((global_index, score, info))
 
-    if not ordered_indices:
-        return []
 
-    ordered_indices.sort(key=lambda pair: pair[0])
+    ordered_indices: list[tuple[int, HeadingInfo]] = []
+    last_index = -1
+    for heading in toc_headings:
+        key = _normalize_heading_key(heading)
+        queue = candidate_map.get(key)
+        if not queue:
+            continue
+        while queue and queue[0][0] <= last_index:
+            queue.popleft()
+        if not queue:
+            continue
+
+        best_pos = 0
+        best_index, best_score, best_info = queue[0]
+        for idx, (global_index, score, info) in enumerate(queue):
+            if global_index <= last_index:
+                continue
+            if score > best_score or (score == best_score and global_index > best_index):
+                best_pos = idx
+                best_index = global_index
+                best_score = score
+                best_info = info
+
+        for _ in range(best_pos):
+            queue.popleft()
+        start_idx, _score, chosen_info = queue.popleft()
+        last_index = start_idx
+        ordered_indices.append((start_idx, chosen_info))
 
     sections: list[str] = []
     for idx, (start_idx, _info) in enumerate(ordered_indices):
@@ -349,7 +446,6 @@ def _split_body_by_headings(
         if section_text:
             sections.append(section_text)
     return sections
-
 
 def export_sections(
     sections: Sequence[str],

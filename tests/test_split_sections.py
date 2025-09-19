@@ -82,3 +82,46 @@ def test_split_sections_generates_debug_toc(tmp_path: Path) -> None:
         "1 概述",
         "1.1 概述介绍",
     ]
+
+
+
+def test_split_sections_avoids_cross_reference_headings(tmp_path: Path) -> None:
+    """Text that references another heading should not trigger a new section."""
+
+    markdown = tmp_path / "cross_ref.md"
+    markdown.write_text(
+        "\n".join(
+            [
+                "## Page 1",
+                "",
+                "目录",
+                "1 第一节 .......... 1",
+                "1.1 第二节 .......... 2",
+                "",
+                "## Page 2",
+                "",
+                "1 第一节",
+                "第一节内容",
+                "处理步骤：",
+                "1.1 第二节",
+                "第二节标题",
+                "请参见下一节了解详情。",
+                "仍在第一节的正文。",
+                "",
+                "## Page 3",
+                "",
+                "1.1 第二节",
+                "第二节标题",
+                "第二节的正文内容。",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    sections = split_sections(markdown)
+
+    assert len(sections) == 2
+    assert "请参见下一节" in sections[0]
+    assert "第二节的正文内容" in sections[1]
+    assert "请参见下一节" not in sections[1]
+
